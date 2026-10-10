@@ -11,7 +11,7 @@ use crate::toolchain::Toolchain;
 use crate::verify::{print_verification, verify_recent_artifacts};
 use crate::wrappers::{Wrappers, prepend_path};
 
-const OPERATIONS: &[&str] = &["build", "check", "rustc", "clippy", "doc"];
+const OPERATIONS: &[&str] = &["build", "check", "clippy", "doc"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CargoInvocation {
@@ -211,7 +211,7 @@ fn ensure_rust_target(target: &str, offline: bool, trace: bool) -> anyhow::Resul
 }
 
 fn should_verify(operation: &str) -> bool {
-    matches!(operation, "build" | "rustc")
+    operation == "build"
 }
 
 fn artifact_root(cargo: &OsStr, invocation: &CargoInvocation) -> anyhow::Result<PathBuf> {

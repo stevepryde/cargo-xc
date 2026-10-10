@@ -26,7 +26,7 @@ cargo xc build --release --target x86_64-unknown-linux-gnu.2.36
 
 The output is written to `target/x86_64-unknown-linux-gnu/release/`. After each build, `cargo-xc` checks that every new binary is x86-64 ELF and imports no glibc symbol newer than the requested baseline.
 
-`build`, `check`, `rustc`, `clippy` and `doc` are supported, and other Cargo options are passed through.
+`build`, `check`, `clippy` and `doc` are supported, and other Cargo options are passed through.
 
 ## Targets
 
