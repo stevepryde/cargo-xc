@@ -1,16 +1,17 @@
-use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use fs2::FileExt;
+use tokio::fs::{self, File, OpenOptions};
 
 #[derive(Clone, Debug)]
 pub struct Cache {
     root: PathBuf,
 }
 
+/// Exclusive advisory lock on the cache; released when dropped.
 pub struct CacheLock {
-    file: File,
+    file: Option<File>,
 }
 
 impl Cache {
@@ -46,37 +47,46 @@ impl Cache {
         self.root.join("wrappers").join(identity)
     }
 
-    pub fn ensure(&self) -> anyhow::Result<()> {
+    pub async fn ensure(&self) -> anyhow::Result<()> {
         fs::create_dir_all(&self.root)
+            .await
             .with_context(|| format!("failed to create cache {}", self.root.display()))
     }
 
-    pub fn lock(&self) -> anyhow::Result<CacheLock> {
-        self.ensure()?;
+    pub async fn lock(&self) -> anyhow::Result<CacheLock> {
+        self.ensure().await?;
         let path = self.root.join(".lock");
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&path)?;
-        file.lock_exclusive()
+            .open(&path)
+            .await?
+            .into_std()
+            .await;
+        // async-guard: allow spawn-blocking: fs2 flock has no async API
+        let file = tokio::task::spawn_blocking(move || file.lock_exclusive().map(|()| file))
+            .await
+            .context("cache lock task panicked")?
             .with_context(|| format!("failed to lock {}", path.display()))?;
-        Ok(CacheLock { file })
+        Ok(CacheLock {
+            file: Some(File::from_std(file)),
+        })
     }
 
-    pub fn clean(&self) -> anyhow::Result<()> {
-        let _lock = self.lock()?;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
+    pub async fn clean(&self) -> anyhow::Result<()> {
+        let _lock = self.lock().await?;
+        let mut entries = fs::read_dir(&self.root).await?;
+        while let Some(entry) = entries.next_entry().await? {
             if entry.file_name() == ".lock" {
                 continue;
             }
             let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(path)?;
+            if entry.file_type().await?.is_dir() {
+                fs::remove_dir_all(path).await?;
             } else {
-                fs::remove_file(path)?;
+                fs::remove_file(path).await?;
             }
         }
         Ok(())
@@ -85,6 +95,10 @@ impl Cache {
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        // Closing the descriptor releases the flock; unlock explicitly when the
+        // file is idle so the release does not wait on a background close.
+        if let Some(Ok(file)) = self.file.take().map(File::try_into_std) {
+            let _ = FileExt::unlock(&file);
+        }
     }
 }

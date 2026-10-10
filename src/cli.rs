@@ -1,15 +1,15 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
+use tokio::fs;
 
 use crate::cache::Cache;
 use crate::cargo_proxy::CargoInvocation;
-use crate::target::{RUST_TARGET, SUPPORTED_GLIBC, Target};
+use crate::target::{Target, find_target_argument, supported_targets};
 use crate::toolchain::Toolchain;
 
-pub fn run(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<u8> {
+pub async fn run(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<u8> {
     let mut args: Vec<OsString> = args.into_iter().collect();
     if !args.is_empty() {
         args.remove(0);
@@ -31,40 +31,41 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<u8> {
         }
         Some("targets") => {
             println!("Supported and verified toolchain baselines:");
-            for baseline in SUPPORTED_GLIBC {
-                println!("  {RUST_TARGET}.{baseline}");
+            for target in supported_targets() {
+                println!("  {target}");
             }
             Ok(0)
         }
-        Some("docker") => crate::docker::run(&args[1..], trace),
+        Some("docker") => crate::docker::run(&args[1..], trace).await,
+        Some("lambda") => crate::lambda::run(&args[1..], &cache, trace).await,
         Some("doctor") => {
             let target = management_target(&args[1..])?;
-            let _ = crate::doctor::run(&cache, &target, verbose)?;
+            let _ = crate::doctor::run(&cache, &target, verbose).await?;
             Ok(0)
         }
         Some("init") => {
-            let path = crate::lockfile::init(&std::env::current_dir()?)?;
+            let path = crate::lockfile::init(&std::env::current_dir()?).await?;
             println!("Created {}", path.display());
             Ok(0)
         }
-        Some("lock") => lock_command(&cache, &args[1..]),
-        Some("verify") => verify_command(&cache, &args[1..]),
-        Some("toolchain") => toolchain_command(&cache, &args[1..]),
-        Some("cache") => cache_command(&cache, &args[1..]),
+        Some("lock") => lock_command(&cache, &args[1..]).await,
+        Some("verify") => verify_command(&cache, &args[1..]).await,
+        Some("toolchain") => toolchain_command(&cache, &args[1..]).await,
+        Some("cache") => cache_command(&cache, &args[1..]).await,
         _ => {
             let offline = args
                 .iter()
                 .any(|arg| arg == "--offline" || arg == "--frozen");
             let invocation = CargoInvocation::parse(args)?;
-            crate::cargo_proxy::execute(&invocation, &cache, offline, trace)
+            crate::cargo_proxy::execute(&invocation, &cache, offline, trace).await
         }
     }
 }
 
-fn toolchain_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
+async fn toolchain_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("list") => {
-            let manifests = crate::toolchain::installed(cache)?;
+            let manifests = crate::toolchain::installed(cache).await?;
             if manifests.is_empty() {
                 println!("No cargo-xc toolchains installed");
             } else {
@@ -75,24 +76,24 @@ fn toolchain_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
         }
         Some("install") => {
             let target = positional_target(&args[1..])?;
-            let toolchain = Toolchain::install_system(cache, &target)?;
+            let toolchain = Toolchain::install_system(cache, &target).await?;
             println!("Installed {}", toolchain.manifest.identity);
             println!("Manifest: {}", toolchain.manifest_path.display());
         }
         Some("inspect") => {
             let target = positional_target(&args[1..])?;
-            let toolchain = Toolchain::load(cache, &target)?;
+            let toolchain = Toolchain::load(cache, &target).await?;
             println!("{}", serde_json::to_string_pretty(&toolchain.manifest)?);
         }
         Some("remove") => {
             let target = positional_target(&args[1..])?;
-            let _lock = cache.lock()?;
+            let _lock = cache.lock().await?;
             let path = cache.toolchain(&Toolchain::identity(&target));
             if path.exists() {
-                fs::remove_dir_all(&path)?;
+                fs::remove_dir_all(&path).await?;
                 let wrappers = cache.wrappers(&Toolchain::identity(&target));
                 if wrappers.exists() {
-                    fs::remove_dir_all(wrappers)?;
+                    fs::remove_dir_all(wrappers).await?;
                 }
                 println!("Removed {}", target.qualified());
             } else {
@@ -104,10 +105,10 @@ fn toolchain_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-fn cache_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
+async fn cache_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("clean") => {
-            cache.clean()?;
+            cache.clean().await?;
             println!("Cleaned {}", cache.root().display());
             Ok(0)
         }
@@ -115,28 +116,30 @@ fn cache_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     }
 }
 
-fn lock_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
+async fn lock_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     let target = management_target(args)?;
     let update = args.iter().any(|arg| arg == "--update");
     let toolchain = Toolchain::load(cache, &target)
+        .await
         .with_context(|| format!("install {} before locking", target.qualified()))?;
-    let path = crate::lockfile::write(&std::env::current_dir()?, &target, &toolchain, update)?;
+    let path =
+        crate::lockfile::write(&std::env::current_dir()?, &target, &toolchain, update).await?;
     println!("Wrote {}", path.display());
     Ok(0)
 }
 
-fn verify_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
+async fn verify_command(cache: &Cache, args: &[OsString]) -> anyhow::Result<u8> {
     let target = management_target(args)?;
-    let toolchain = Toolchain::load(cache, &target)?;
+    let toolchain = Toolchain::load(cache, &target).await?;
     let path = management_positionals(args)
         .into_iter()
         .next()
         .map(PathBuf::from);
     if let Some(path) = path {
-        let result = crate::verify::verify_file(&path, &target, toolchain.tool("readelf")?)?;
+        let result = crate::verify::verify_file(&path, &target, toolchain.tool("readelf")?).await?;
         crate::verify::print_verification(&result, &target);
     } else {
-        crate::lockfile::verify(&std::env::current_dir()?, &toolchain)?;
+        crate::lockfile::verify(&std::env::current_dir()?, &toolchain).await?;
         println!(
             "{} matches installed toolchain {}",
             crate::lockfile::LOCK_FILE,
@@ -154,23 +157,7 @@ fn positional_target(args: &[OsString]) -> anyhow::Result<Target> {
 }
 
 fn management_target(args: &[OsString]) -> anyhow::Result<Target> {
-    for (index, argument) in args.iter().enumerate() {
-        if argument == "--target" {
-            return args
-                .get(index + 1)
-                .context("--target requires a value")?
-                .to_str()
-                .context("target must be UTF-8")?
-                .parse();
-        }
-        if let Some(value) = argument
-            .to_str()
-            .and_then(|arg| arg.strip_prefix("--target="))
-        {
-            return value.parse();
-        }
-    }
-    Ok(Target::default())
+    Ok(find_target_argument(args)?.unwrap_or_default())
 }
 
 fn take_flag(args: &mut Vec<OsString>, flag: &str) -> bool {
@@ -204,7 +191,7 @@ fn management_positionals(args: &[OsString]) -> Vec<&OsStr> {
 
 fn print_help() {
     println!(
-        "cargo-xc {}\n\nNative ARM64 Linux to AMD64 GNU/Linux Cargo cross-compilation.\n\nUSAGE:\n    cargo xc [OPERATION] [CARGO OPTIONS] --target {RUST_TARGET}[.GLIBC]\n    cargo xc docker [OPERATION] [CARGO OPTIONS]\n    cargo xc <COMMAND>\n\nOPERATIONS:\n    build (default), check, clippy, doc\n\nCOMMANDS:\n    targets                         List genuinely provisioned baselines\n    doctor [--target TARGET]        Diagnose the active builder and toolchain\n    docker <ARGS>                   Build inside a native linux/arm64 container\n    toolchain list                  List cached toolchains\n    toolchain install [TARGET]      Register installed native cross tools\n    toolchain inspect [TARGET]      Print the immutable manifest\n    toolchain remove [TARGET]       Remove a cached toolchain\n    cache clean                     Remove all cargo-xc cache data\n    init                            Create cargo-xc.toml\n    lock [--update]                 Write cargo-xc.lock\n    verify [FILE]                   Verify a lock or AMD64 ELF artifact\n\nGLOBAL OPTIONS:\n    --trace                         Print managed subprocess invocations\n    --offline, --frozen             Forbid provisioning and forward to Cargo\n    -h, --help                      Print help\n    -V, --version                   Print version",
+        "cargo-xc {}\n\nCargo builds for x86-64 and ARM64 GNU/Linux from an ARM64 host.\n\nUSAGE:\n    cargo xc [OPERATION] [CARGO OPTIONS] --target TARGET[.GLIBC]\n    cargo xc docker [OPERATION] [CARGO OPTIONS]\n    cargo xc lambda [CARGO OPTIONS] [--bin NAME] [--zip PATH]\n    cargo xc <COMMAND>\n\nOPERATIONS:\n    build (default), check, clippy, doc\n\nCOMMANDS:\n    targets                         List supported targets\n    doctor [--target TARGET]        Diagnose the active builder and toolchain\n    docker <ARGS>                   Build inside a native linux/arm64 container\n    lambda [ARGS]                   Build for AWS Lambda provided.al2023 ARM64 and zip a bootstrap package\n    toolchain list                  List cached toolchains\n    toolchain install [TARGET]      Register installed native cross tools\n    toolchain inspect [TARGET]      Print the immutable manifest\n    toolchain remove [TARGET]       Remove a cached toolchain\n    cache clean                     Remove all cargo-xc cache data\n    init                            Create cargo-xc.toml\n    lock [--update]                 Write cargo-xc.lock\n    verify [FILE]                   Verify a lock or ELF artifact\n\nGLOBAL OPTIONS:\n    --trace                         Print managed subprocess invocations\n    --offline, --frozen             Forbid provisioning and forward to Cargo\n    -h, --help                      Print help\n    -V, --version                   Print version",
         crate::VERSION
     );
 }

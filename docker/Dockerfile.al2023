@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+# ARM64 Amazon Linux 2023 builder: native aarch64 compiles against the exact
+# glibc 2.34 that the AWS Lambda provided.al2023 runtime ships.
+ARG AL2023_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
+ARG RUST_VERSION="1.96.0"
+
+FROM --platform=linux/arm64 ${AL2023_IMAGE} AS base
+ARG RUST_VERSION
+
+RUN test "$(rpm --eval '%{_arch}')" = aarch64 \
+    && dnf install -y \
+       binutils \
+       clang-devel \
+       clang-libs \
+       cmake \
+       gcc \
+       gcc-c++ \
+       git \
+       gzip \
+       ninja-build \
+       openssh-clients \
+       pkgconf-pkg-config \
+       tar \
+    && dnf clean all
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}"
+
+FROM base AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+RUN cargo build --locked --release
+
+FROM base
+
+COPY --from=builder /src/target/release/cargo-xc /usr/local/bin/cargo-xc
+COPY docker/entrypoint.sh /usr/local/bin/cargo-xc-container
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/cargo-xc-container"]
+CMD ["cargo", "xc", "--help"]

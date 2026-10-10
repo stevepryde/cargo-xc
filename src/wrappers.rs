@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
 
 use crate::cache::Cache;
 use crate::target::Target;
@@ -18,36 +17,53 @@ pub struct Wrappers {
 }
 
 impl Wrappers {
-    pub fn prepare(cache: &Cache, target: &Target, toolchain: &Toolchain) -> anyhow::Result<Self> {
-        let _lock = cache.lock()?;
+    pub async fn prepare(
+        cache: &Cache,
+        target: &Target,
+        toolchain: &Toolchain,
+    ) -> anyhow::Result<Self> {
+        let _lock = cache.lock().await?;
+        let spec = target.spec();
         let directory = cache.wrappers(&toolchain.manifest.identity);
-        fs::create_dir_all(&directory)?;
+        fs::create_dir_all(&directory).await?;
         let mut programs = BTreeMap::new();
-        for (role, conventional) in [
-            ("cc", "x86_64-linux-gnu-cc"),
-            ("cxx", "x86_64-linux-gnu-c++"),
-            ("cc", "x86_64-linux-gnu-gcc"),
-            ("cxx", "x86_64-linux-gnu-g++"),
-            ("ar", "x86_64-linux-gnu-ar"),
-            ("ranlib", "x86_64-linux-gnu-ranlib"),
-            ("strip", "x86_64-linux-gnu-strip"),
-            ("objcopy", "x86_64-linux-gnu-objcopy"),
-            ("nm", "x86_64-linux-gnu-nm"),
-            ("readelf", "x86_64-linux-gnu-readelf"),
+        for (role, suffix) in [
+            ("cc", "cc"),
+            ("cxx", "c++"),
+            ("cc", "gcc"),
+            ("cxx", "g++"),
+            ("ar", "ar"),
+            ("ranlib", "ranlib"),
+            ("strip", "strip"),
+            ("objcopy", "objcopy"),
+            ("nm", "nm"),
+            ("readelf", "readelf"),
         ] {
-            let path = directory.join(conventional);
-            write_exec_wrapper(&path, toolchain.tool(role)?, &[])?;
+            let path = directory.join(format!("{}-{suffix}", spec.gnu_prefix));
+            write_exec_wrapper(&path, toolchain.tool(role)?, &[]).await?;
             programs.entry(role.to_owned()).or_insert(path);
         }
-        let pkg_config = directory.join("x86_64-linux-gnu-pkg-config");
-        write_pkg_config_wrapper(&pkg_config, &toolchain.manifest.sysroot)?;
+        let pkg_config = directory.join(format!("{}-pkg-config", spec.gnu_prefix));
+        write_pkg_config_wrapper(
+            &pkg_config,
+            &toolchain.manifest.sysroot,
+            spec.pkg_config_dirs,
+        )
+        .await?;
         programs.insert("pkg_config".into(), pkg_config);
         let cmake_toolchain = directory.join("cargo-xc-toolchain.cmake");
-        write_cmake_toolchain(&cmake_toolchain, &programs, &toolchain.manifest.sysroot)?;
+        write_cmake_toolchain(
+            &cmake_toolchain,
+            &programs,
+            &toolchain.manifest.sysroot,
+            spec.architecture,
+        )
+        .await?;
         fs::write(
             directory.join("identity"),
             format!("{}\n", target.qualified()),
-        )?;
+        )
+        .await?;
         Ok(Self {
             directory,
             programs,
@@ -63,7 +79,11 @@ impl Wrappers {
     }
 }
 
-fn write_exec_wrapper(path: &Path, program: &Path, fixed_args: &[&str]) -> anyhow::Result<()> {
+async fn write_exec_wrapper(
+    path: &Path,
+    program: &Path,
+    fixed_args: &[&str],
+) -> anyhow::Result<()> {
     let mut content = format!(
         "#!/bin/sh\nexec {}",
         quote(program.as_os_str().to_string_lossy().as_ref())
@@ -73,32 +93,36 @@ fn write_exec_wrapper(path: &Path, program: &Path, fixed_args: &[&str]) -> anyho
         content.push_str(&quote(argument));
     }
     content.push_str(" \"$@\"\n");
-    write_executable(path, content.as_bytes())
+    write_executable(path, content.as_bytes()).await
 }
 
-fn write_pkg_config_wrapper(path: &Path, sysroot: &Path) -> anyhow::Result<()> {
+async fn write_pkg_config_wrapper(
+    path: &Path,
+    sysroot: &Path,
+    pkg_config_dirs: &[&str],
+) -> anyhow::Result<()> {
     let pkg_config = find_in_path("pkg-config").context(
         "pkg-config is required for target dependency discovery; install it in the builder image",
     )?;
     let root = quote(sysroot.as_os_str().to_string_lossy().as_ref());
-    let libdir = format!(
-        "{}/usr/lib/x86_64-linux-gnu/pkgconfig:{}/usr/lib/pkgconfig:{}/usr/share/pkgconfig",
-        sysroot.display(),
-        sysroot.display(),
-        sysroot.display()
-    );
+    let libdir = pkg_config_dirs
+        .iter()
+        .map(|dir| format!("{}/{dir}", sysroot.display()))
+        .collect::<Vec<_>>()
+        .join(":");
     let content = format!(
         "#!/bin/sh\nexport PKG_CONFIG_SYSROOT_DIR={root}\nexport PKG_CONFIG_LIBDIR={}\nunset PKG_CONFIG_PATH\nexec {} \"$@\"\n",
         quote(&libdir),
         quote(pkg_config.as_os_str().to_string_lossy().as_ref())
     );
-    write_executable(path, content.as_bytes())
+    write_executable(path, content.as_bytes()).await
 }
 
-fn write_cmake_toolchain(
+async fn write_cmake_toolchain(
     path: &Path,
     programs: &BTreeMap<String, PathBuf>,
     sysroot: &Path,
+    processor: &str,
 ) -> anyhow::Result<()> {
     let get = |role: &str| -> anyhow::Result<String> {
         Ok(programs
@@ -108,7 +132,7 @@ fn write_cmake_toolchain(
             .to_string())
     };
     let content = format!(
-        "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR x86_64)\nset(CMAKE_C_COMPILER \"{}\")\nset(CMAKE_CXX_COMPILER \"{}\")\nset(CMAKE_AR \"{}\")\nset(CMAKE_RANLIB \"{}\")\nset(CMAKE_STRIP \"{}\")\nset(CMAKE_SYSROOT \"{}\")\nset(CMAKE_FIND_ROOT_PATH \"{}\")\nset(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\nset(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)\nset(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)\nset(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)\n",
+        "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR {processor})\nset(CMAKE_C_COMPILER \"{}\")\nset(CMAKE_CXX_COMPILER \"{}\")\nset(CMAKE_AR \"{}\")\nset(CMAKE_RANLIB \"{}\")\nset(CMAKE_STRIP \"{}\")\nset(CMAKE_SYSROOT \"{}\")\nset(CMAKE_FIND_ROOT_PATH \"{}\")\nset(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\nset(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)\nset(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)\nset(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)\n",
         get("cc")?,
         get("cxx")?,
         get("ar")?,
@@ -117,11 +141,11 @@ fn write_cmake_toolchain(
         sysroot.display(),
         sysroot.display()
     );
-    write_if_changed(path, content.as_bytes())
+    write_if_changed(path, content.as_bytes()).await
 }
 
-fn write_executable(path: &Path, content: &[u8]) -> anyhow::Result<()> {
-    if fs::read(path).ok().as_deref() == Some(content) {
+async fn write_executable(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    if fs::read(path).await.ok().as_deref() == Some(content) {
         return Ok(());
     }
     let mut file = OpenOptions::new()
@@ -129,14 +153,16 @@ fn write_executable(path: &Path, content: &[u8]) -> anyhow::Result<()> {
         .truncate(true)
         .write(true)
         .mode(0o755)
-        .open(path)?;
-    file.write_all(content)?;
+        .open(path)
+        .await?;
+    file.write_all(content).await?;
+    file.flush().await?;
     Ok(())
 }
 
-fn write_if_changed(path: &Path, content: &[u8]) -> anyhow::Result<()> {
-    if fs::read(path).ok().as_deref() != Some(content) {
-        fs::write(path, content)?;
+async fn write_if_changed(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    if fs::read(path).await.ok().as_deref() != Some(content) {
+        fs::write(path, content).await?;
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 # cargo-xc
 
-`cargo-xc` is a Cargo subcommand that cross-compiles Rust from ARM64 (Apple Silicon or ARM64 Linux) to x86-64 GNU/Linux using native ARM64-hosted GNU cross tools. It doesn't use emulation, and it never runs the target binaries during a build.
+`cargo-xc` is a Cargo subcommand that builds Rust for x86-64 and ARM64 GNU/Linux from an ARM64 machine (Apple Silicon or ARM64 Linux). It doesn't use emulation, and it never runs the target binaries during a build.
 
 ## Install
 
@@ -8,31 +8,46 @@
 cargo install cargo-xc
 ```
 
-Docker is required on macOS. The first `cargo xc docker` run builds a local `cargo-xc:<version>` builder image.
+Docker is required on macOS. The first `cargo xc docker` run for each target builds a local builder image.
+
+## Targets
+
+| Target | Runs on | Builder |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu.2.36` | x86-64 Linux with glibc 2.36+ (Debian 12, Ubuntu 23.04+) | Debian 12 with GNU cross tools |
+| `aarch64-unknown-linux-gnu.2.34` | ARM64 Linux with glibc 2.34+ (Amazon Linux 2023, Debian 12, Ubuntu 22.04+, AWS Lambda) | Amazon Linux 2023, native |
+
+The suffix is the newest glibc the binary may require. A plain triple uses that target's default, and any other suffix is rejected. Run `cargo xc targets` to list them.
 
 ## Usage
 
 On macOS, build inside a native `linux/arm64` container:
 
 ```console
-cargo xc docker build --release --target x86_64-unknown-linux-gnu.2.36
+cargo xc docker build --release --target x86_64-unknown-linux-gnu
+cargo xc docker build --release --target aarch64-unknown-linux-gnu
 ```
 
-On ARM64 Linux with Debian's `crossbuild-essential-amd64`, `g++-x86-64-linux-gnu` and `binutils-x86-64-linux-gnu` installed, build directly:
+On ARM64 Linux, build directly. The x86-64 target needs Debian's `crossbuild-essential-amd64`, `g++-x86-64-linux-gnu` and `binutils-x86-64-linux-gnu`. The ARM64 target needs Amazon Linux 2023 with `gcc`, `gcc-c++` and `binutils`.
 
 ```console
-cargo xc build --release --target x86_64-unknown-linux-gnu.2.36
+cargo xc build --release --target x86_64-unknown-linux-gnu
 ```
 
-The output is written to `target/x86_64-unknown-linux-gnu/release/`. After each build, `cargo-xc` checks that every new binary is x86-64 ELF and imports no glibc symbol newer than the requested baseline.
+The output is written to `target/<triple>/release/`. After each build, `cargo-xc` checks that every new binary has the target's architecture and dynamic loader, and reports the newest glibc version it imports.
 
-`build`, `check`, `clippy` and `doc` are supported, and other Cargo options are passed through.
+`build`, `check`, `clippy` and `doc` are supported, and other Cargo options are passed through. C and C++ dependencies built with `cc-rs`, CMake, pkg-config or bindgen are configured for the target automatically.
 
-## Targets
+## AWS Lambda
 
-Only `x86_64-unknown-linux-gnu.2.36` is supported. The suffix is the newest glibc the binary may require, so it runs on glibc 2.36 or later (Debian 12, Ubuntu 23.04+). Plain `x86_64-unknown-linux-gnu` means 2.36. Any other suffix is rejected.
+`cargo xc lambda` builds a release binary for the ARM64 `provided.al2023` runtime and packages it as a `bootstrap` zip:
 
-C and C++ dependencies built with `cc-rs`, CMake, pkg-config or bindgen are configured for the target automatically.
+```console
+cargo xc docker lambda
+cargo xc docker lambda --bin my-function --zip dist/my-function.zip
+```
+
+The default package path is `target/lambda/<binary>/bootstrap.zip`.
 
 ## Private Git dependencies
 
@@ -43,7 +58,7 @@ C and C++ dependencies built with `cc-rs`, CMake, pkg-config or bindgen are conf
 ```console
 cargo xc targets                 # list supported targets
 cargo xc doctor --verbose        # diagnose the toolchain
-cargo xc toolchain install       # register the installed cross tools
+cargo xc toolchain install       # register the installed build tools
 cargo xc toolchain list|inspect|remove
 cargo xc init                    # create cargo-xc.toml
 cargo xc lock [--update]         # pin toolchain versions and checksums in cargo-xc.lock
@@ -51,7 +66,7 @@ cargo xc verify [FILE]           # check the lock file, or check a built binary
 cargo xc cache clean
 ```
 
-Global options: `--trace` prints the commands that `cargo-xc` runs, and `--offline`/`--frozen` stop it downloading anything (they're also passed to Cargo). Set `CARGO_XC_CACHE_DIR` to move the cache.
+Commands that take a target default to `x86_64-unknown-linux-gnu`; pass `--target` to choose another. Global options: `--trace` prints the commands that `cargo-xc` runs, and `--offline`/`--frozen` stop it downloading anything (they're also passed to Cargo). Set `CARGO_XC_CACHE_DIR` to move the cache.
 
 ## License
 

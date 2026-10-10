@@ -1,11 +1,11 @@
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 
 use crate::cache::Cache;
+use crate::process::Managed;
 use crate::target::Target;
 use crate::toolchain::Toolchain;
 use crate::verify::{print_verification, verify_recent_artifacts};
@@ -58,8 +58,9 @@ impl CargoInvocation {
             }
             index += 1;
         }
-        let target = target
-            .context("a target is required; use `--target x86_64-unknown-linux-gnu[.GLIBC]`")?;
+        let target = target.context(
+            "a target is required; use `--target x86_64-unknown-linux-gnu[.GLIBC]` or `--target aarch64-unknown-linux-gnu[.GLIBC]`",
+        )?;
         target.ensure_supported()?;
         Ok(Self {
             operation,
@@ -69,23 +70,21 @@ impl CargoInvocation {
     }
 }
 
-pub fn execute(
+pub async fn execute(
     invocation: &CargoInvocation,
     cache: &Cache,
     offline: bool,
     trace: bool,
 ) -> anyhow::Result<u8> {
-    ensure_rust_target(invocation.target.cargo_triple(), offline, trace)?;
-    let toolchain = Toolchain::load(cache, &invocation.target).or_else(|error| {
-        if offline {
-            Err(error)
-        } else {
-            Toolchain::install_system(cache, &invocation.target)
-        }
-    })?;
-    let wrappers = Wrappers::prepare(cache, &invocation.target, &toolchain)?;
+    ensure_rust_target(invocation.target.cargo_triple(), offline, trace).await?;
+    let toolchain = match Toolchain::load(cache, &invocation.target).await {
+        Ok(toolchain) => toolchain,
+        Err(error) if offline => return Err(error),
+        Err(_) => Toolchain::install_system(cache, &invocation.target).await?,
+    };
+    let wrappers = Wrappers::prepare(cache, &invocation.target, &toolchain).await?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(&cargo);
+    let mut command = Managed::new(&cargo);
     command.arg(&invocation.operation).args(&invocation.args);
     configure_environment(&mut command, invocation, &toolchain, &wrappers)?;
     if trace {
@@ -94,19 +93,20 @@ pub fn execute(
     let started = SystemTime::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    let status = command.status().context("failed to start Cargo")?;
+    let status = command.status().await.context("failed to start Cargo")?;
     if !status.success() {
         return Ok(status.code().unwrap_or(1).try_into().unwrap_or(1));
     }
 
     if should_verify(&invocation.operation) {
-        let output_root = artifact_root(&cargo, invocation)?;
+        let output_root = artifact_root(&cargo, invocation).await?;
         let results = verify_recent_artifacts(
             &output_root,
             started,
             &invocation.target,
             wrappers.program("readelf")?,
-        )?;
+        )
+        .await?;
         for result in &results {
             print_verification(result, &invocation.target);
         }
@@ -123,7 +123,7 @@ pub fn execute(
 }
 
 fn configure_environment(
-    command: &mut Command,
+    command: &mut Managed,
     invocation: &CargoInvocation,
     toolchain: &Toolchain,
     wrappers: &Wrappers,
@@ -179,10 +179,10 @@ fn configure_environment(
     Ok(())
 }
 
-fn ensure_rust_target(target: &str, offline: bool, trace: bool) -> anyhow::Result<()> {
-    let list = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output();
+async fn ensure_rust_target(target: &str, offline: bool, trace: bool) -> anyhow::Result<()> {
+    let mut list = Managed::new("rustup");
+    list.args(["target", "list", "--installed"]);
+    let list = list.output().await;
     let installed = list
         .as_ref()
         .ok()
@@ -201,9 +201,9 @@ fn ensure_rust_target(target: &str, offline: bool, trace: bool) -> anyhow::Resul
     if trace {
         eprintln!("[cargo-xc trace] rustup target add {target}");
     }
-    let status = Command::new("rustup")
-        .args(["target", "add", target])
-        .status()?;
+    let mut add = Managed::new("rustup");
+    add.args(["target", "add", target]);
+    let status = add.status().await?;
     if !status.success() {
         bail!("rustup failed to install target `{target}`");
     }
@@ -214,24 +214,22 @@ fn should_verify(operation: &str) -> bool {
     operation == "build"
 }
 
-fn artifact_root(cargo: &OsStr, invocation: &CargoInvocation) -> anyhow::Result<PathBuf> {
-    if let Some(path) = option_value(&invocation.args, "--target-dir") {
+pub async fn target_directory(cargo: &OsStr, args: &[OsString]) -> anyhow::Result<PathBuf> {
+    if let Some(path) = option_value(args, "--target-dir") {
         let path = PathBuf::from(path);
         return Ok(if path.is_absolute() {
             path
         } else {
             std::env::current_dir()?.join(path)
-        }
-        .join(invocation.target.cargo_triple())
-        .join(profile(&invocation.args)));
+        });
     }
-    let mut metadata = Command::new(cargo);
+    let mut metadata = Managed::new(cargo);
     metadata.args(["metadata", "--no-deps", "--format-version", "1"]);
-    if let Some(path) = option_value(&invocation.args, "--manifest-path") {
+    if let Some(path) = option_value(args, "--manifest-path") {
         metadata.arg("--manifest-path").arg(path);
     }
     metadata.env_remove("CARGO");
-    let output = metadata.output()?;
+    let output = metadata.output().await?;
     if !output.status.success() {
         bail!("failed to determine Cargo target directory after build");
     }
@@ -239,12 +237,17 @@ fn artifact_root(cargo: &OsStr, invocation: &CargoInvocation) -> anyhow::Result<
     let target_dir = value["target_directory"]
         .as_str()
         .context("cargo metadata omitted target_directory")?;
-    Ok(Path::new(target_dir)
+    Ok(PathBuf::from(target_dir))
+}
+
+pub async fn artifact_root(cargo: &OsStr, invocation: &CargoInvocation) -> anyhow::Result<PathBuf> {
+    Ok(target_directory(cargo, &invocation.args)
+        .await?
         .join(invocation.target.cargo_triple())
         .join(profile(&invocation.args)))
 }
 
-fn profile(args: &[OsString]) -> String {
+pub fn profile(args: &[OsString]) -> String {
     option_value(args, "--profile")
         .and_then(OsStr::to_str)
         .map_or_else(

@@ -1,27 +1,29 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, bail};
+use tokio::fs;
 
-const IMAGE: &str = concat!("cargo-xc:", env!("CARGO_PKG_VERSION"));
+use crate::process::Managed;
+use crate::target::{BuilderImage, Target};
 
-pub fn run(args: &[OsString], trace: bool) -> anyhow::Result<u8> {
-    let image = ensure_image(trace)?;
+pub async fn run(args: &[OsString], trace: bool) -> anyhow::Result<u8> {
+    let builder = builder_for(args)?;
+    let image = ensure_image(builder, trace).await?;
     let workspace = std::env::current_dir()?;
     let cache = crate::cache::Cache::discover()?;
-    cache.ensure()?;
+    cache.ensure().await?;
     let cargo_home = cache.root().join("cargo-home");
-    std::fs::create_dir_all(&cargo_home).with_context(|| {
+    fs::create_dir_all(&cargo_home).await.with_context(|| {
         format!(
             "failed to create isolated Docker Cargo cache {}",
             cargo_home.display()
         )
     })?;
     if is_cargo_operation(args) {
-        prefetch(args, &cargo_home, trace)?;
+        prefetch(args, &cargo_home, trace).await?;
     }
-    let mut command = Command::new("docker");
+    let mut command = Managed::new("docker");
     command
         .args(["run", "--rm", "--platform", "linux/arm64"])
         .arg("-v")
@@ -36,7 +38,7 @@ pub fn run(args: &[OsString], trace: bool) -> anyhow::Result<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::metadata(&workspace)?;
+        let metadata = fs::metadata(&workspace).await?;
         command
             .arg("--user")
             .arg(format!("{}:{}", metadata.uid(), metadata.gid()));
@@ -45,11 +47,22 @@ pub fn run(args: &[OsString], trace: bool) -> anyhow::Result<u8> {
     if trace {
         eprintln!("[cargo-xc trace] docker command: {command:?}");
     }
-    let status = command.status().context("failed to start Docker")?;
+    let status = command.status().await.context("failed to start Docker")?;
     Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
 }
 
-// Mirrors the management commands routed by `cli::run`; everything else is a Cargo operation.
+/// The builder image family the forwarded invocation needs. An explicit
+/// `--target` wins; `lambda` defaults to the ARM64 Lambda target.
+fn builder_for(args: &[OsString]) -> anyhow::Result<&'static BuilderImage> {
+    let target = match crate::target::find_target_argument(args)? {
+        Some(target) => target,
+        None if args.first().is_some_and(|arg| arg == "lambda") => Target::lambda_default(),
+        None => Target::default(),
+    };
+    Ok(&target.spec().builder)
+}
+
+// Mirrors the management commands routed by `cli::run`; everything else builds with Cargo.
 fn is_cargo_operation(args: &[OsString]) -> bool {
     !matches!(
         args.first().and_then(|arg| arg.to_str()),
@@ -73,7 +86,7 @@ fn is_cargo_operation(args: &[OsString]) -> bool {
 
 /// Downloads dependencies on the host with the user's own Git credentials so the
 /// container never receives any credential.
-fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result<()> {
+async fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result<()> {
     if args
         .iter()
         .any(|arg| arg == "--offline" || arg == "--frozen")
@@ -81,7 +94,7 @@ fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result
         return Ok(());
     }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(cargo);
+    let mut command = Managed::new(cargo);
     command
         .arg("fetch")
         .env("CARGO_HOME", cargo_home)
@@ -106,6 +119,7 @@ fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result
     }
     let status = command
         .status()
+        .await
         .context("failed to run cargo fetch on the host")?;
     if !status.success() {
         bail!(
@@ -115,36 +129,38 @@ fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result
     Ok(())
 }
 
-fn ensure_image(trace: bool) -> anyhow::Result<String> {
-    let exists = Command::new("docker")
-        .args(["image", "inspect", IMAGE])
+async fn ensure_image(builder: &BuilderImage, trace: bool) -> anyhow::Result<String> {
+    let mut inspect = Managed::new("docker");
+    inspect.args(["image", "inspect", builder.local_tag]);
+    let exists = inspect
         .output()
+        .await
         .is_ok_and(|output| output.status.success());
     if exists {
-        return Ok(IMAGE.into());
+        return Ok(builder.local_tag.into());
     }
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dockerfile = repo.join("docker/Dockerfile");
-    let mut command = Command::new("docker");
+    let mut command = Managed::new("docker");
     command
         .args([
             "build",
             "--platform",
             "linux/arm64",
             "--tag",
-            IMAGE,
+            builder.local_tag,
             "--file",
         ])
-        .arg(dockerfile)
+        .arg(repo.join(builder.dockerfile))
         .arg(&repo);
     if trace {
         eprintln!("[cargo-xc trace] docker build: {command:?}");
     }
     let status = command
         .status()
+        .await
         .context("failed to build ARM64 cargo-xc image")?;
     if !status.success() {
-        bail!("Docker failed to build {IMAGE}");
+        bail!("Docker failed to build {}", builder.local_tag);
     }
-    Ok(IMAGE.into())
+    Ok(builder.local_tag.into())
 }

@@ -1,24 +1,23 @@
-use std::process::Command;
-
 use crate::cache::Cache;
+use crate::process::Managed;
 use crate::target::Target;
 use crate::toolchain::Toolchain;
 use crate::wrappers::Wrappers;
 
-pub fn run(cache: &Cache, target: &Target, verbose: bool) -> anyhow::Result<bool> {
+pub async fn run(cache: &Cache, target: &Target, verbose: bool) -> anyhow::Result<bool> {
     println!("cargo-xc doctor");
     println!("Host OS: {}", std::env::consts::OS);
     println!("Host architecture: {}", std::env::consts::ARCH);
     let native_arm64 = cfg!(target_os = "linux") && cfg!(target_arch = "aarch64");
     println!("Native ARM64 Linux builder: {}", yes_no(native_arm64));
-    println!("Rust: {}", command_version("rustc"));
-    println!("Cargo: {}", command_version("cargo"));
+    println!("Rust: {}", command_version("rustc").await);
+    println!("Cargo: {}", command_version("cargo").await);
     println!("Selected target: {}", target.cargo_triple());
     println!("Selected glibc baseline: {}", target.glibc_short());
     println!("Cache: {}", cache.root().display());
-    match Toolchain::load(cache, target) {
+    match Toolchain::load(cache, target).await {
         Ok(toolchain) => {
-            let wrappers = Wrappers::prepare(cache, target, &toolchain)?;
+            let wrappers = Wrappers::prepare(cache, target, &toolchain).await?;
             println!("Compiler: {}", toolchain.tool("cc")?.display());
             println!("Compiler version: {}", toolchain.manifest.compiler_version);
             println!(
@@ -57,10 +56,12 @@ pub fn run(cache: &Cache, target: &Target, verbose: bool) -> anyhow::Result<bool
     }
 }
 
-fn command_version(program: &str) -> String {
-    Command::new(program)
-        .arg("--version")
+async fn command_version(program: &str) -> String {
+    let mut command = Managed::new(program);
+    command.arg("--version");
+    command
         .output()
+        .await
         .ok()
         .filter(|output| output.status.success())
         .map_or_else(

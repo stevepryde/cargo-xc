@@ -1,0 +1,20 @@
+#!/bin/sh
+# Stand-in for the docker CLI used by tests/cli.rs. `image inspect` succeeds
+# so no build or pull happens; `run` records its PID and blocks until it is
+# signalled, exiting on SIGTERM the way a real `docker run` would.
+case "$1" in
+  image)
+    exit 0
+    ;;
+  run)
+    echo "$$" > "$CARGO_XC_TEST_DOCKER_PIDFILE"
+    trap 'kill "$sleeper" 2>/dev/null; exit 143' TERM INT
+    sleep 60 &
+    sleeper=$!
+    wait "$sleeper"
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac

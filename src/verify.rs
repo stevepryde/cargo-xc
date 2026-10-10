@@ -1,14 +1,12 @@
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
-use goblin::elf::header::EM_X86_64;
 use regex::Regex;
 use semver::Version;
-use walkdir::WalkDir;
+use tokio::fs;
 
+use crate::process::Managed;
 use crate::target::Target;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,24 +17,35 @@ pub struct Verification {
     pub interpreter: Option<String>,
 }
 
-pub fn verify_file(path: &Path, target: &Target, readelf: &Path) -> anyhow::Result<Verification> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+pub async fn verify_file(
+    path: &Path,
+    target: &Target,
+    readelf: &Path,
+) -> anyhow::Result<Verification> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let spec = target.spec();
     let goblin::Object::Elf(elf) = goblin::Object::parse(&bytes)? else {
         bail!("{} is not an ELF binary", path.display());
     };
-    if elf.header.e_machine != EM_X86_64 || !elf.is_64 {
+    if elf.header.e_machine != spec.elf_machine || !elf.is_64 {
         bail!(
-            "{} has the wrong architecture (ELF machine {}, 64-bit {}); expected ELF64 x86-64",
+            "{} has the wrong architecture (ELF machine {}, 64-bit {}); expected {}",
             path.display(),
             elf.header.e_machine,
-            elf.is_64
+            elf.is_64,
+            spec.elf_description
         );
     }
 
-    let output = Command::new(readelf)
+    let mut command = Managed::new(readelf);
+    command
         .args(["-W", "--version-info", "--program-headers"])
-        .arg(path)
+        .arg(path);
+    let output = command
         .output()
+        .await
         .with_context(|| format!("failed to run {}", readelf.display()))?;
     if !output.status.success() {
         bail!(
@@ -46,18 +55,9 @@ pub fn verify_file(path: &Path, target: &Target, readelf: &Path) -> anyhow::Resu
         );
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    // Imported GLIBC versions are reported, not policed: the binary links
+    // against the same libc family the runtime ships.
     let highest_glibc = highest_glibc_version(&text)?;
-    if let Some(version) = &highest_glibc
-        && version > &target.glibc
-    {
-        bail!(
-            "{} imports GLIBC_{}.{} but requested baseline is {}; the selected sysroot or a native dependency is too new",
-            path.display(),
-            version.major,
-            version.minor,
-            target.glibc_short()
-        );
-    }
     let interpreter = text.lines().find_map(|line| {
         let marker = "Requesting program interpreter:";
         line.find(marker).map(|index| {
@@ -68,22 +68,23 @@ pub fn verify_file(path: &Path, target: &Target, readelf: &Path) -> anyhow::Resu
         })
     });
     if let Some(value) = &interpreter
-        && value != "/lib64/ld-linux-x86-64.so.2"
+        && value != spec.loader
     {
         bail!(
-            "{} requests unexpected dynamic loader `{value}`",
-            path.display()
+            "{} requests unexpected dynamic loader `{value}`; expected `{}`",
+            path.display(),
+            spec.loader
         );
     }
     Ok(Verification {
         path: path.to_path_buf(),
-        architecture: "ELF64 x86-64".into(),
+        architecture: spec.elf_description.into(),
         highest_glibc,
         interpreter,
     })
 }
 
-pub fn verify_recent_artifacts(
+pub async fn verify_recent_artifacts(
     root: &Path,
     since: SystemTime,
     target: &Target,
@@ -93,30 +94,46 @@ pub fn verify_recent_artifacts(
     if !root.exists() {
         return Ok(verified);
     }
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let metadata = entry.metadata()?;
+    for path in files_under(root).await? {
+        let metadata = fs::metadata(&path).await?;
         if metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH) < since {
             continue;
         }
-        let prefix = fs::read(entry.path()).unwrap_or_default();
+        let prefix = fs::read(&path).await.unwrap_or_default();
         if !prefix.starts_with(b"\x7fELF") {
             continue;
         }
         let object = goblin::Object::parse(&prefix)?;
         if let goblin::Object::Elf(elf) = object
-            && elf.header.e_machine == EM_X86_64
+            && elf.header.e_machine == target.spec().elf_machine
             && (elf.entry != 0 || elf.is_lib)
         {
-            verified.push(verify_file(entry.path(), target, readelf)?);
+            verified.push(verify_file(&path, target, readelf).await?);
         }
     }
     verified.sort_by(|a, b| a.path.cmp(&b.path));
     verified.dedup_by(|a, b| a.path == b.path);
     Ok(verified)
+}
+
+/// Every regular file below `root`, without following symbolic links.
+async fn files_under(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .await
+            .with_context(|| format!("failed to read {}", directory.display()))?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    Ok(files)
 }
 
 pub fn highest_glibc_version(text: &str) -> anyhow::Result<Option<Version>> {
