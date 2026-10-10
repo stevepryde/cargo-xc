@@ -4,8 +4,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LOCAL_IMAGE: &str = "cargo-xc:local";
-const RELEASE_IMAGE: &str = concat!("ghcr.io/stevepryde/cargo-xc:", env!("CARGO_PKG_VERSION"));
+const IMAGE: &str = concat!("cargo-xc:", env!("CARGO_PKG_VERSION"));
 
 pub fn run(args: &[OsString], trace: bool) -> anyhow::Result<u8> {
     let image = ensure_image(trace)?;
@@ -118,26 +117,14 @@ fn prefetch(args: &[OsString], cargo_home: &Path, trace: bool) -> anyhow::Result
 
 fn ensure_image(trace: bool) -> anyhow::Result<String> {
     let exists = Command::new("docker")
-        .args(["image", "inspect", LOCAL_IMAGE])
+        .args(["image", "inspect", IMAGE])
         .output()
         .is_ok_and(|output| output.status.success());
     if exists {
-        return Ok(LOCAL_IMAGE.into());
+        return Ok(IMAGE.into());
     }
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dockerfile = repo.join("docker/Dockerfile");
-    if !dockerfile.is_file() {
-        let status = Command::new("docker")
-            .args(["pull", "--platform", "linux/arm64", RELEASE_IMAGE])
-            .status()
-            .context("failed to pull the released ARM64 cargo-xc image")?;
-        if !status.success() {
-            bail!(
-                "could not pull {RELEASE_IMAGE}; the installed cargo-xc version needs its matching released builder image"
-            );
-        }
-        return Ok(RELEASE_IMAGE.into());
-    }
     let mut command = Command::new("docker");
     command
         .args([
@@ -145,7 +132,7 @@ fn ensure_image(trace: bool) -> anyhow::Result<String> {
             "--platform",
             "linux/arm64",
             "--tag",
-            LOCAL_IMAGE,
+            IMAGE,
             "--file",
         ])
         .arg(dockerfile)
@@ -157,7 +144,7 @@ fn ensure_image(trace: bool) -> anyhow::Result<String> {
         .status()
         .context("failed to build ARM64 cargo-xc image")?;
     if !status.success() {
-        bail!("Docker failed to build {LOCAL_IMAGE}");
+        bail!("Docker failed to build {IMAGE}");
     }
-    Ok(LOCAL_IMAGE.into())
+    Ok(IMAGE.into())
 }

@@ -8,7 +8,7 @@
 cargo install cargo-xc
 ```
 
-Docker is required on macOS.
+Docker is required on macOS. The first `cargo xc docker` run builds a local `cargo-xc:<version>` builder image.
 
 ## Usage
 
@@ -37,23 +37,6 @@ C and C++ dependencies built with `cc-rs`, CMake, pkg-config or bindgen are conf
 ## Private Git dependencies
 
 `cargo xc docker` runs `cargo fetch` on the host before starting the container, using your normal Git credentials (SSH agent or Git credential helper). The container gets the downloaded sources but no credentials.
-
-## Using the builder image in a Dockerfile
-
-The builder is published as `ghcr.io/stevepryde/cargo-xc:<version>` and can be used as a normal BuildKit build stage:
-
-```dockerfile
-FROM --platform=linux/arm64 ghcr.io/stevepryde/cargo-xc:0.1.0 AS builder
-WORKDIR /src
-COPY . .
-RUN cargo xc build --locked --release --target x86_64-unknown-linux-gnu.2.36
-
-FROM --platform=linux/amd64 debian:bookworm-slim
-COPY --from=builder /src/target/x86_64-unknown-linux-gnu/release/my-app /usr/local/bin/my-app
-CMD ["my-app"]
-```
-
-To build and push the builder image yourself, run `scripts/publish-builder-image.sh [IMAGE_REF]`. Set `DOCKER_OUTPUT=--load` to load it locally instead of pushing.
 
 ## Commands
 
