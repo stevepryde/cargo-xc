@@ -11,17 +11,13 @@ use crate::toolchain::Toolchain;
 use crate::verify::{print_verification, verify_recent_artifacts};
 use crate::wrappers::{Wrappers, prepend_path};
 
-const OPERATIONS: &[&str] = &[
-    "build", "check", "rustc", "test", "bench", "run", "clippy", "doc",
-];
+const OPERATIONS: &[&str] = &["build", "check", "rustc", "clippy", "doc"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CargoInvocation {
     pub operation: String,
     pub args: Vec<OsString>,
     pub target: Target,
-    pub requires_runner: bool,
-    pub compile_only_fallback: bool,
 }
 
 impl CargoInvocation {
@@ -65,15 +61,10 @@ impl CargoInvocation {
         let target = target
             .context("a target is required; use `--target x86_64-unknown-linux-gnu[.GLIBC]`")?;
         target.ensure_supported()?;
-        let requires_runner = matches!(operation.as_str(), "run" | "test" | "bench");
-        let has_no_run = args.iter().any(|arg| arg == "--no-run");
-        let compile_only_fallback = matches!(operation.as_str(), "test" | "bench") && !has_no_run;
         Ok(Self {
             operation,
             args,
             target,
-            requires_runner,
-            compile_only_fallback,
         })
     }
 }
@@ -93,28 +84,9 @@ pub fn execute(
         }
     })?;
     let wrappers = Wrappers::prepare(cache, &invocation.target, &toolchain)?;
-    let runner_key = format!("CARGO_TARGET_{}_RUNNER", invocation.target.cargo_env_key());
-    let runner_available = std::env::var_os(&runner_key).is_some();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(&cargo);
-    if invocation.operation == "run" && !runner_available {
-        command.arg("build").args(
-            invocation
-                .args
-                .iter()
-                .take_while(|argument| argument.as_os_str() != "--"),
-        );
-    } else {
-        command.arg(&invocation.operation).args(&invocation.args);
-    }
-    if invocation.compile_only_fallback && !runner_available {
-        command.arg("--no-run");
-    }
-    if invocation.operation == "run" && !runner_available {
-        bail!(
-            "target compilation succeeded, but `run` requires executing an AMD64 binary. Configure {runner_key} with a native/remote AMD64 runner; no QEMU was used"
-        );
-    }
+    command.arg(&invocation.operation).args(&invocation.args);
     configure_environment(&mut command, invocation, &toolchain, &wrappers)?;
     if trace {
         eprintln!("[cargo-xc trace] cargo command: {command:?}");
@@ -146,12 +118,6 @@ pub fn execute(
                 output_root.display()
             );
         }
-    }
-    if invocation.compile_only_fallback && !runner_available {
-        bail!(
-            "target compilation succeeded, but `{}` requires executing AMD64 binaries. Configure {runner_key} with a native/remote AMD64 runner; no QEMU was used",
-            invocation.operation
-        );
     }
     Ok(0)
 }
@@ -245,7 +211,7 @@ fn ensure_rust_target(target: &str, offline: bool, trace: bool) -> anyhow::Resul
 }
 
 fn should_verify(operation: &str) -> bool {
-    matches!(operation, "build" | "rustc" | "test" | "bench" | "run")
+    matches!(operation, "build" | "rustc")
 }
 
 fn artifact_root(cargo: &OsStr, invocation: &CargoInvocation) -> anyhow::Result<PathBuf> {
