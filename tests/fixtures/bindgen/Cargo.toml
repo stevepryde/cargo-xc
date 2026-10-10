@@ -1,0 +1,11 @@
+[package]
+name = "cargo-xc-fixture-bindgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1.2"
+
+[workspace]

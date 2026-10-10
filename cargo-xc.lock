@@ -1,0 +1,19 @@
+schema = 1
+cargo_xc_version = "0.1.0"
+target = "x86_64-unknown-linux-gnu.2.36"
+rustc = "rustc 1.88.0 (6b00bc388 2025-06-23)"
+cargo = "cargo 1.88.0 (873a06493 2025-05-10)"
+toolchain_identity = "x86_64-unknown-linux-gnu.2.36"
+compiler_version = "x86_64-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0"
+linker_version = "GNU readelf (GNU Binutils for Debian) 2.40"
+sysroot = "/"
+
+[tool_checksums]
+ar = "8d724dbe353e6444533a9995350957411e0bca4b88cbd842e8b3d7125f423fa9"
+cc = "2193668b123cf07d07b20d6d3cb2927402baa70158fce5a725642c74e43ec2bd"
+cxx = "3ff9e87dac5d53c92e6c2cf94645746ca8352a6fed70423258c69f90d014a786"
+nm = "6dee71f4f1187edb564acc8a1dbf30288622ccc0ba64b44eaa4540ddd9eda10c"
+objcopy = "718661638c0d5376829b255e9757c1e75cac1d3d07e1b2804326840313c5a897"
+ranlib = "48b43f541077ac017d0f01d80004f443954921088ddcd83a726c07d0d4716117"
+readelf = "4a2671dc2adb04a33ac6e9eeedb24d401f31332d276edb0d9635436b74bffed0"
+strip = "c3a1ddc9c43668f3c9adb63050a9740ca45af2b4ff5ad3e5ebd6b94c19e5d247"

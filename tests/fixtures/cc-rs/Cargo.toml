@@ -1,0 +1,10 @@
+[package]
+name = "cargo-xc-fixture-cc-rs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+cc = "1.2"
+
+[workspace]

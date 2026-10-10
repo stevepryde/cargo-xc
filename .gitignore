@@ -1,0 +1,12 @@
+/target/
+**/target/
+
+# rustfmt backups and MSVC debug symbols
+**/*.rs.bk
+*.pdb
+
+# cargo-mutants output
+**/mutants.out*/
+
+# macOS Finder metadata
+.DS_Store

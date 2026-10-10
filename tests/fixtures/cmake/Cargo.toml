@@ -1,0 +1,10 @@
+[package]
+name = "cargo-xc-fixture-cmake"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+cmake = "0.1"
+
+[workspace]
